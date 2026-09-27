@@ -2038,6 +2038,7 @@ def _(DATASETS, INPUT_DIR, ROOT, mo):
     mo.vstack(
         [
             tr_name,
+            tr_url,
             tr_zip,
             tr_files,
             mo.hstack([tr_sr, tr_f0, tr_embedder], justify="start"),
