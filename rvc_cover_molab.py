@@ -1,7 +1,7 @@
 import marimo
 
 __generated_with = "0.25.0"
-app = marimo.App(width="medium", app_title="RVC AI 翻唱 · molab Evo")
+app = marimo.App(width="medium", app_title="RVC AI 翻唱 · molab Evo Plus")
 
 
 @app.cell(hide_code=True)
@@ -21,13 +21,13 @@ def _():
         4. 第 ③–⑥ 步：歌曲 → 分离 → RVC → 混音
         5. 可选第 ⑦ 步训练自己的声音模型
 
-        ### 本版修复 / 升级
-        - 自动下载训练所需预训练权重
-        - 修复训练时报 `No module named data_utils`
-        - 支持选择已有 zip 数据集 / 上传 zip 数据集
-        - zip 内递归提取音频 / 视频并自动转 WAV
-        - 修复 Applio 训练成功误报但没有 `.pth` 的问题
-        - 推理加入 Evo 前处理 / 后处理：响度规整、高通、轻降噪、齿音控制、刺耳频段抑制、压缩、限幅
+        ### 本版修复 / 升级（Evo Plus）
+        - 修复训练单元格 `nonlocal` 语法错误
+        - 第 ⑦ 步支持 **URL 直链拉取数据集 zip**，zip 内递归提取音频 / 视频并自动转 WAV
+        - 第 ⑦ 步 **🤖 智能训练**：自动 batch / 自动轮数 / 自动缓存；训练后解析损失曲线挑选最优 checkpoint
+        - 第 ④ 步 **🤖 自动最优分离链路** + 人声双模型集成（可开关）
+        - 第 ⑥ 步 **母带级后处理**：伴奏闪避 + 两遍式 loudnorm 响度规整（-14 LUFS）
+        - 新增 ⑧⁺ 分离 WebUI（Gradio 公网页面，复用同一套模型库）
         """
     )
     return (mo,)
@@ -1290,6 +1290,12 @@ def _(mo):
     sep_dereverb = mo.ui.dropdown(DEREVERB_MODELS, value="BS-Roformer De-Reverb · 推荐", label="3. 去混响")
     sep_denoise = mo.ui.dropdown(DENOISE_MODELS, value="不降噪", label="4. 降噪")
 
+    sep_auto = mo.ui.checkbox(
+        label="🤖 自动最优链路：Kim FT3 人声 → 和声分离 → 去混响 → 降噪（忽略上面手动选择）",
+        value=True,
+    )
+    sep_ensemble = mo.ui.checkbox(label="🧬 人声双模型集成：Kim FT3 + Viperx1297 求平均（更稳，耗时翻倍）", value=False)
+
     sep_skip = mo.ui.checkbox(label="输入已经是干声（跳过分离，直接转换）")
     sep_btn = mo.ui.run_button(label="✂️ 开始分离", kind="success")
 
@@ -1297,12 +1303,13 @@ def _(mo):
         [
             mo.hstack([sep_vocal, sep_karaoke]),
             mo.hstack([sep_dereverb, sep_denoise]),
+            mo.hstack([sep_auto, sep_ensemble], justify="start"),
             sep_skip,
             sep_btn,
         ]
     )
 
-    return sep_btn, sep_denoise, sep_dereverb, sep_karaoke, sep_skip, sep_vocal
+    return sep_btn, sep_denoise, sep_dereverb, sep_karaoke, sep_ensemble, sep_auto, sep_skip, sep_vocal
 
 
 @app.cell
@@ -1318,12 +1325,40 @@ def _(
     sep_denoise,
     sep_dereverb,
     sep_karaoke,
+    sep_ensemble,
+    sep_auto,
     sep_skip,
     sep_vocal,
     sh,
     shutil,
 ):
     mo.stop(not sep_btn.value, mo.md("_选好模型后点「开始分离」（模型首次使用会自动下载）_"))
+
+    _vocal_m = "mel_band_roformer_kim_ft3_unwa.ckpt" if sep_auto.value else sep_vocal.value
+    _karaoke_m = "mel_band_roformer_karaoke_becruily.ckpt" if sep_auto.value else sep_karaoke.value
+    _dereverb_m = "deverb_bs_roformer_8_384dim_10depth.ckpt" if sep_auto.value else sep_dereverb.value
+    _denoise_m = "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt" if sep_auto.value else sep_denoise.value
+
+    def _avg(a, b, out):
+        out = str(out)
+        sh(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                a,
+                "-i",
+                b,
+                "-filter_complex",
+                "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0[out]",
+                "-map",
+                "[out]",
+                out,
+            ]
+        )
+        return out
 
     def _run_sep(inp, model, prefix):
         _rc, _tail = sh(
@@ -1353,21 +1388,26 @@ def _(
         sh(["ffmpeg", "-y", "-loglevel", "error", "-i", SONG, "-ar", "44100", _dry])
         STEMS["lead"] = str(_dry)
     else:
-        _r = _run_sep(SONG, sep_vocal.value, "1_vocals")
+        _r = _run_sep(SONG, _vocal_m, "1_vocals")
         STEMS["vocals"], STEMS["instrumental"] = _r["main"], _r["rest"]
 
         _lead = _r["main"]
 
-        if sep_karaoke.value:
-            _r = _run_sep(_lead, sep_karaoke.value, "2_lead")
+        if sep_ensemble.value:
+            _r2 = _run_sep(SONG, "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "1b_vocals")
+            _lead = _avg(_lead, _r2["main"], SONG_OUT / "1_vocals_ensemble.wav")
+            STEMS["vocals"] = _lead
+
+        if _karaoke_m:
+            _r = _run_sep(_lead, _karaoke_m, "2_lead")
             _lead, STEMS["backing"] = _r["main"], _r["rest"]
 
-        if sep_dereverb.value:
-            _r = _run_sep(_lead, sep_dereverb.value, "3_dereverb")
+        if _dereverb_m:
+            _r = _run_sep(_lead, _dereverb_m, "3_dereverb")
             _lead = _r["main"]
 
-        if sep_denoise.value:
-            _r = _run_sep(_lead, sep_denoise.value, "4_denoise")
+        if _denoise_m:
+            _r = _run_sep(_lead, _denoise_m, "4_denoise")
             _lead = _r["main"]
 
         _final = SONG_OUT / "lead_dry.wav"
@@ -1698,6 +1738,9 @@ def _(mo):
     mix_room = mo.ui.slider(0, 1, 0.05, value=0.3, label="房间大小", show_value=True, full_width=True)
     mix_comp = mo.ui.checkbox(label="主唱压缩", value=True)
     mix_follow = mo.ui.checkbox(label="伴奏/和声跟随变调（变调不是 ±12 的整倍数时勾选）")
+    mix_duck = mo.ui.checkbox(label="🦆 伴奏闪避：人声出现时伴奏自动让位（推荐）", value=True)
+    mix_master = mo.ui.checkbox(label="🎚 母带级响度规整：两遍式 loudnorm（流媒体标准）", value=True)
+    mix_lufs = mo.ui.slider(-18, -9, 0.5, value=-14, label="目标响度 LUFS", show_value=True)
     mix_btn = mo.ui.run_button(label="🎚️ 混音并导出", kind="success")
 
     mo.vstack(
@@ -1708,6 +1751,7 @@ def _(mo):
             mix_reverb,
             mix_room,
             mo.hstack([mix_comp, mix_follow], justify="start"),
+            mo.hstack([mix_duck, mix_master, mix_lufs], justify="start"),
             mix_btn,
         ]
     )
@@ -1716,9 +1760,12 @@ def _(mo):
         mix_back_db,
         mix_btn,
         mix_comp,
+        mix_duck,
         mix_follow,
         mix_inst_db,
         mix_lead_db,
+        mix_lufs,
+        mix_master,
         mix_reverb,
         mix_room,
     )
@@ -1738,15 +1785,21 @@ def _(
     mix_back_db,
     mix_btn,
     mix_comp,
+    mix_duck,
     mix_follow,
     mix_inst_db,
     mix_lead_db,
+    mix_lufs,
+    mix_master,
     mix_reverb,
     mix_room,
     mo,
     rvc_pitch,
+    re,
     safe_name,
     sh,
+    subprocess,
+    venv_env,
     voice_model,
     zipfile,
 ):
@@ -1757,6 +1810,29 @@ def _(
     _vn = safe_name(voice_model.value)
 
     _out = SONG_OUT / f"{SONG.stem}_{_vn}_cover.wav"
+
+    _inst = STEMS.get("instrumental")
+
+    if mix_duck.value and _inst and "lead" in CONVERTED:
+        _ducked = SONG_OUT / "inst_ducked.wav"
+        sh(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                _inst,
+                "-i",
+                CONVERTED["lead"],
+                "-filter_complex",
+                "[0:a][1:a]sidechaincompress=threshold=0.02:ratio=6:attack=15:release=400[dk]",
+                "-map",
+                "[dk]",
+                str(_ducked),
+            ]
+        )
+        _inst = _ducked
 
     _cmd = [
         VPY,
@@ -1780,8 +1856,8 @@ def _(
         _follow,
     ]
 
-    if "instrumental" in STEMS:
-        _cmd += ["--inst", STEMS["instrumental"]]
+    if _inst:
+        _cmd += ["--inst", str(_inst)]
 
     _bk = CONVERTED.get("backing") or STEMS.get("backing")
     if _bk:
@@ -1793,6 +1869,35 @@ def _(
     _rc, _tail = sh(_cmd)
     _res = json.loads([l for l in _tail if l.startswith("RESULT_JSON=")][-1][12:])
     _final = _res.get("mp3") or _res["wav"]
+
+    if mix_master.value:
+        _wav = _res["wav"]
+        _af = f"loudnorm=I={mix_lufs.value}:TP=-1.5:LRA=11"
+        _meas = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", _wav, "-af", _af + ":print_format=json", "-f", "null", "-"],
+            env=venv_env(),
+            capture_output=True,
+            text=True,
+        )
+        _m = re.search(r'\{[^{}]*"input_i"[^{}]*\}', _meas.stderr, re.S)
+
+        if _m:
+            try:
+                _mm = json.loads(_m.group(0))
+                _af += (
+                    f":measured_I={_mm['input_i']}:measured_TP={_mm['input_tp']}"
+                    f":measured_LRA={_mm['input_lra']}:measured_thresh={_mm['input_thresh']}"
+                    f":offset={_mm['target_offset']}:linear=true"
+                )
+            except Exception:
+                pass
+
+        _master = SONG_OUT / f"{SONG.stem}_{_vn}_cover_master.wav"
+        sh(["ffmpeg", "-y", "-loglevel", "error", "-i", _wav, "-af", _af, "-ar", "44100", str(_master)])
+        _mp3 = str(_master)[:-4] + ".mp3"
+        sh(["ffmpeg", "-y", "-loglevel", "error", "-i", str(_master), "-b:a", "320k", _mp3])
+        _final = _mp3
+        _res["master"] = str(_master)
 
     _zip = SONG_OUT / f"{SONG.stem}_{_vn}_all_stems.zip"
 
@@ -1828,8 +1933,9 @@ def _(mo):
         推荐数据：
         - 10–30 分钟干净干声
         - 无伴奏、少混响、少噪声
-        - 可以上传 zip，或选择已有 zip
+        - 支持上传 zip / URL 直链拉取 zip / 选择已有 zip
         - zip 内支持音频 / 视频递归提取
+        - 🤖 智能训练：自动 batch / 轮数 / 缓存，训练后按损失曲线挑最优 checkpoint
         """
     )
     return
@@ -1857,6 +1963,12 @@ def _(DATASETS, INPUT_DIR, ROOT, mo):
     _zip_options = ["不使用已有 zip"] + [str(p) for p in _zips]
 
     tr_name = mo.ui.text(label="模型名称（英文/数字/下划线）", value="MyVoice")
+
+    tr_url = mo.ui.text(
+        label="或粘贴数据集 zip 直链（http/https；HF resolve / GitHub 直链均可）",
+        placeholder="https://…/dataset.zip",
+        full_width=True,
+    )
 
     tr_zip = mo.ui.dropdown(
         _zip_options,
@@ -1916,7 +2028,12 @@ def _(DATASETS, INPUT_DIR, ROOT, mo):
     tr_cache = mo.ui.checkbox(label="数据缓存到显存（更快，大数据集显存不足时关闭）", value=True)
     tr_cleanup = mo.ui.checkbox(label="清除同名旧训练重新开始", value=True)
 
-    tr_btn = mo.ui.run_button(label="🏋️ 提取数据集 → 预处理 → 提取特征 → 训练 → 建索引", kind="success")
+    tr_auto = mo.ui.checkbox(
+        label="🤖 智能训练：自动 batch / 自动轮数 / 自动缓存；训练后解析损失曲线挑选最优 checkpoint（忽略手动值）",
+        value=True,
+    )
+
+    tr_btn = mo.ui.run_button(label="🏋️ 提取数据集 → 智能配置 → 预处理 → 特征 → 训练 → 挑最优 → 建索引", kind="success")
 
     mo.vstack(
         [
@@ -1927,11 +2044,13 @@ def _(DATASETS, INPUT_DIR, ROOT, mo):
             mo.hstack([tr_vocoder, tr_cut, tr_nr, tr_pretrained], justify="start"),
             mo.hstack([tr_epochs, tr_batch, tr_save], justify="start"),
             mo.hstack([tr_cache, tr_cleanup], justify="start"),
+            tr_auto,
             tr_btn,
         ]
     )
 
     return (
+        tr_auto,
         tr_batch,
         tr_btn,
         tr_cache,
@@ -1946,6 +2065,7 @@ def _(DATASETS, INPUT_DIR, ROOT, mo):
         tr_pretrained,
         tr_save,
         tr_sr,
+        tr_url,
         tr_vocoder,
         tr_zip,
     )
@@ -1972,6 +2092,7 @@ def _(
     shutil,
     subprocess,
     time,
+    tr_auto,
     tr_batch,
     tr_btn,
     tr_cache,
@@ -1986,6 +2107,7 @@ def _(
     tr_pretrained,
     tr_save,
     tr_sr,
+    tr_url,
     tr_vocoder,
     tr_zip,
     venv_env,
@@ -2013,15 +2135,49 @@ def _(
     _zip_choice = getattr(tr_zip, "value", "") or ""
     _use_existing_zip = bool(_zip_choice and _zip_choice != "不使用已有 zip")
     _has_uploaded_files = bool(tr_files.value)
+    _url_choice = (getattr(tr_url, "value", "") or "").strip()
+    _use_url = bool(_url_choice)
 
-    if _has_uploaded_files or _use_existing_zip:
+    if _has_uploaded_files or _use_existing_zip or _use_url:
         shutil.rmtree(_ds, ignore_errors=True)
         shutil.rmtree(_raw, ignore_errors=True)
         _ds.mkdir(parents=True, exist_ok=True)
         _raw.mkdir(parents=True, exist_ok=True)
 
         _raw_files = []
-        _counter = 0
+        _counter = [0]
+
+        if _use_url:
+            _url_zip = DATASETS / f"{_name}__url.zip"
+            print(f"⬇️ 下载数据集 zip：{_url_choice}")
+
+            import urllib.request
+
+            _req = urllib.request.Request(
+                _url_choice, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
+            )
+
+            with urllib.request.urlopen(_req, timeout=60) as _resp, open(_url_zip, "wb") as _out:
+                _total = int(_resp.headers.get("Content-Length") or 0)
+                _done = 0
+
+                while True:
+                    _chunk = _resp.read(1024 * 1024)
+
+                    if not _chunk:
+                        break
+
+                    _out.write(_chunk)
+                    _done += len(_chunk)
+
+                    if _total:
+                        print(f"\r   {_done / 1048576:.1f} / {_total / 1048576:.1f} MB", end="", flush=True)
+
+            print()
+            mo.stop(
+                not (_url_zip.exists() and _url_zip.stat().st_size > 1024),
+                mo.callout("数据集 zip 下载失败，请检查链接是否为可公开访问的直链。", kind="danger"),
+            )
 
         def _skip_zip_member(name):
             norm = name.replace("\\", "/")
@@ -2035,14 +2191,13 @@ def _(
             )
 
         def _add_stream(src, name):
-            nonlocal _counter
             suffix = _Path(name).suffix.lower()
 
             if suffix not in _MEDIA_EXTS:
                 return
 
-            _counter += 1
-            dst = _raw / f"{_counter:05d}_{safe_name(_Path(name).stem)}{suffix}"
+            _counter[0] += 1
+            dst = _raw / f"{_counter[0]:05d}_{safe_name(_Path(name).stem)}{suffix}"
 
             with open(dst, "wb") as out:
                 shutil.copyfileobj(src, out, 1024 * 1024)
@@ -2050,14 +2205,13 @@ def _(
             _raw_files.append(dst)
 
         def _add_bytes(data, name):
-            nonlocal _counter
             suffix = _Path(name).suffix.lower()
 
             if suffix not in _MEDIA_EXTS:
                 return
 
-            _counter += 1
-            dst = _raw / f"{_counter:05d}_{safe_name(_Path(name).stem)}{suffix}"
+            _counter[0] += 1
+            dst = _raw / f"{_counter[0]:05d}_{safe_name(_Path(name).stem)}{suffix}"
             dst.write_bytes(data)
             _raw_files.append(dst)
 
@@ -2090,6 +2244,10 @@ def _(
             mo.stop(not _zp.exists(), mo.callout(f"找不到 zip：`{_zp}`", kind="danger"))
             with zipfile.ZipFile(_zp) as zf:
                 _extract_zip(zf, safe_name(_zp.stem))
+
+        if _use_url:
+            with zipfile.ZipFile(_url_zip) as zf:
+                _extract_zip(zf, safe_name(_url_zip.stem))
 
         for f in tr_files.value or []:
             suffix = _Path(f.name).suffix.lower()
@@ -2241,8 +2399,88 @@ def _(
         cwd=APPLIO,
     )
 
-    _epochs = max(1, int(tr_epochs.value))
-    _save_every = max(1, min(int(tr_save.value), _epochs))
+    def _gpu_mem_mb():
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            return int(r.stdout.strip().splitlines()[0])
+        except Exception:
+            return 0
+
+    def _dataset_seconds(files):
+        total = 0.0
+
+        for p in files:
+            try:
+                r = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "format=duration",
+                        "-of",
+                        "default=nw=1:nk=1",
+                        str(p),
+                    ],
+                    env=venv_env(),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                total += float(r.stdout.strip() or 0)
+            except Exception:
+                pass
+
+        return total
+
+    _gpu_mb = _gpu_mem_mb()
+
+    if tr_auto.value:
+        mo.stop(
+            _gpu_mb <= 0,
+            mo.callout(
+                "🤖 智能训练需要 GPU：请在右上角 notebook specs 打开 GPU，或关闭「智能训练」改为手动配置。",
+                kind="danger",
+            ),
+        )
+
+        _minutes = _dataset_seconds(_dataset_files) / 60.0
+        _ds_bytes = sum(p.stat().st_size for p in _dataset_files)
+
+        if _gpu_mb < 8000:
+            _auto_batch = 4
+        elif _gpu_mb < 12000:
+            _auto_batch = 8
+        elif _gpu_mb < 20000:
+            _auto_batch = 12
+        elif _gpu_mb < 40000:
+            _auto_batch = 16
+        else:
+            _auto_batch = 24
+
+        _auto_epochs = max(150, min(600, round(4000 / max(_minutes, 1.0))))
+        _auto_save_every = max(10, min(50, _auto_epochs // 12))
+        _auto_cache = _gpu_mb >= 16000 and _ds_bytes < 4 * 1024 * 1024 * 1024
+
+        _epochs = _auto_epochs
+        _save_every = _auto_save_every
+        _batch = _auto_batch
+        _use_cache = _auto_cache
+
+        print(
+            f"🤖 智能配置：GPU {_gpu_mb / 1024:.0f} GB | 数据 {len(_dataset_files)} 条 / {_minutes:.1f} 分钟"
+            f" → batch={_batch}, epochs={_epochs}, save_every={_save_every}, cache_in_gpu={_use_cache}"
+        )
+    else:
+        _epochs = max(1, int(tr_epochs.value))
+        _save_every = max(1, min(int(tr_save.value), _epochs))
+        _batch = int(tr_batch.value)
+        _use_cache = tr_cache.value
 
     _tr = [
         VPY,
@@ -2257,7 +2495,7 @@ def _(
         "--sample-rate",
         tr_sr.value,
         "--batch-size",
-        int(tr_batch.value),
+        _batch,
         "--gpu",
         "0",
         "--vocoder",
@@ -2269,7 +2507,7 @@ def _(
     if tr_pretrained.value:
         _tr.append("--pretrained")
 
-    if tr_cache.value:
+    if _use_cache:
         _tr.append("--cache-data-in-gpu")
 
     _t0 = time.time()
@@ -2370,7 +2608,67 @@ def _(
             ),
         )
 
-    _best_w = _weights[0]
+    def _weight_epoch(p):
+        m = (
+            re.search(r"_e(\d+)_s", p.name)
+            or re.search(r"_(\d+)e_\d+s", p.name)
+            or re.search(r"epoch(\d+)", p.name, re.I)
+        )
+        return int(m.group(1)) if m else -1
+
+    def _pick_best():
+        """
+        优先：解析 TensorBoard 损失曲线，选平滑损失最低且已保存权重的 checkpoint；
+        解析失败时回退到最高轮数（训练最充分）。
+        """
+        by_epoch = {}
+
+        for p in _weights:
+            e = _weight_epoch(p)
+
+            if e >= 0:
+                by_epoch[e] = p
+
+        if not by_epoch:
+            return _weights[0], "最新保存"
+
+        max_epoch = max(by_epoch)
+        best_epoch, curve = None, None
+
+        try:
+            from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+            if list(_d.rglob("events.out.tfevents*")):
+                ea = EventAccumulator(str(_d), size_guidance={"scalars": 0})
+                ea.Reload()
+                tags = [t for t in ea.Tags().get("scalars", []) if "loss" in t.lower()]
+                tags.sort(key=lambda t: ("total" not in t.lower(), t))
+
+                if tags:
+                    series = sorted(((s.step, s.value) for s in ea.Scalars(tags[0])), key=lambda x: x[0])
+
+                    if len(series) >= 10:
+                        win = max(5, len(series) // 50)
+                        sm = [
+                            (
+                                st,
+                                sum(v for _, v in series[max(0, i - win) : i + 1])
+                                / len(series[max(0, i - win) : i + 1]),
+                            )
+                            for i, (st, v) in enumerate(series)
+                        ]
+                        spe = max(1.0, max(st for st, _ in series) / max_epoch)
+                        best_epoch = min(by_epoch, key=lambda e: abs(e - round(min(sm, key=lambda x: x[1])[0] / spe)))
+                        curve = tags[0]
+        except Exception as e:
+            print("损失曲线解析失败，回退到最高轮数：", e)
+
+        if best_epoch is None:
+            return by_epoch[max_epoch], f"最高轮数 e{max_epoch}"
+
+        return by_epoch[best_epoch], f"损失曲线最优（{curve}，约 e{best_epoch}）"
+
+    _best_w, _why = _pick_best()
     _d.mkdir(parents=True, exist_ok=True)
 
     if _best_w.parent.resolve() != _d.resolve():
@@ -2396,7 +2694,7 @@ def _(
         [
             mo.callout(
                 mo.md(
-                    f"✅ 训练完成\n\n"
+                    f"✅ 训练完成（最优 checkpoint：{_why}）\n\n"
                     f"- 推理权重：`{_best_w.name}`\n"
                     f"- Index：`{_idx[0].name if _idx else '未找到，可推理但 index rate 应设为 0'}`\n"
                     f"- 已出现在第 ② 步模型列表"
@@ -2489,6 +2787,273 @@ def _(APPLIO, ROOT, VPY, is_installed, mo, re, subprocess, time, ui_start, ui_st
         )
     else:
         _msg = mo.md("_点击启动后约 30–90 秒出现公网链接_")
+
+    _msg
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(
+        r"""
+        ---
+        ## ⑧⁺ 分离 WebUI（可选）
+
+        独立 Gradio 页面：上传音频 → 四段最优链路分离 → 在线试听 / 下载 stems。
+        与第 ④ 步共用 `sep_models` 模型库，模型首次使用自动下载。
+        """
+    )
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    sep_ui_start = mo.ui.run_button(label="🌐 启动分离 WebUI", kind="success")
+    sep_ui_stop = mo.ui.run_button(label="⏹ 停止分离 WebUI", kind="danger")
+    mo.hstack([sep_ui_start, sep_ui_stop], justify="start")
+    return sep_ui_start, sep_ui_stop
+
+
+@app.cell(hide_code=True)
+def _():
+    SEP_WEBUI_SRC = r'''
+    import json
+    import os
+    import shutil
+    import subprocess
+    import time
+    from pathlib import Path
+
+    import gradio as gr
+
+    ROOT = Path(__file__).resolve().parent
+    VENV = ROOT / "venv"
+    VPY = VENV / "bin" / "python"
+    TOOL = ROOT / "cover_tool.py"
+    INPUT_DIR = ROOT / "inputs"
+    OUT_DIR = ROOT / "outputs"
+    SEP_MODELS = ROOT / "sep_models"
+
+    VOCAL_MODELS = {
+        "MelBand Roformer Kim FT3 (unwa) · 推荐": "mel_band_roformer_kim_ft3_unwa.ckpt",
+        "BS-Roformer Viperx 1297 · 经典高分": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+        "MelBand Roformer Kim (原版)": "vocals_mel_band_roformer.ckpt",
+        "MelBand Roformer Vocals (becruily)": "mel_band_roformer_vocals_becruily.ckpt",
+        "MDX23C InstVoc HQ": "MDX23C-8KFFT-InstVoc_HQ.ckpt",
+        "UVR-MDX-NET Voc FT (ONNX, 快)": "UVR-MDX-NET-Voc_FT.onnx",
+    }
+    KARAOKE_MODELS = {
+        "不分离和声": "",
+        "MelBand Karaoke (becruily) · 推荐": "mel_band_roformer_karaoke_becruily.ckpt",
+        "Mel-Roformer Karaoke (aufr33 & viperx)": "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+        "BS Roformer Karaoke (frazer & becruily)": "bs_roformer_karaoke_frazer_becruily.ckpt",
+    }
+    DEREVERB_MODELS = {
+        "不去混响": "",
+        "BS-Roformer De-Reverb · 推荐": "deverb_bs_roformer_8_384dim_10depth.ckpt",
+        "MDX23C De-Reverb (aufr33 & jarredou)": "MDX23C-De-Reverb-aufr33-jarredou.ckpt",
+        "UVR-DeEcho-DeReverb (VR)": "UVR-DeEcho-DeReverb.pth",
+    }
+    DENOISE_MODELS = {
+        "不降噪": "",
+        "Mel-Roformer Denoise (aufr33)": "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt",
+        "Mel-Roformer Denoise Aggr (aufr33)": "denoise_mel_band_roformer_aufr33_aggr_sdr_27.9768.ckpt",
+    }
+
+
+    def _env():
+        env = os.environ.copy()
+        ff = VENV / "ffbin"
+        env["PATH"] = f"{ff}:{VENV / 'bin'}:{env.get('PATH', '')}"
+        env["PYTHONUNBUFFERED"] = "1"
+        return env
+
+
+    def _separate(inp, model, prefix, out_dir):
+        cmd = [
+            str(VPY), str(TOOL), "separate",
+            "--input", str(inp),
+            "--model", model,
+            "--out-dir", str(out_dir),
+            "--prefix", prefix,
+            "--model-dir", str(SEP_MODELS),
+        ]
+        p = subprocess.run(cmd, env=_env(), capture_output=True, text=True)
+        tail = (p.stdout or "") + "\n" + (p.stderr or "")
+        if p.returncode != 0:
+            raise RuntimeError(f"分离命令失败 exit={p.returncode}\n{tail[-2000:]}")
+        js = [l for l in tail.splitlines() if l.startswith("RESULT_JSON=")]
+        if not js:
+            raise RuntimeError(f"分离命令没有返回结果 JSON\n{tail[-2000:]}")
+        return json.loads(js[-1][12:])
+
+
+    def run_chain(upload, server_path, vocal, karaoke, dereverb, denoise, progress=gr.Progress()):
+        src = upload or server_path.strip()
+        if not src:
+            raise gr.Error("请上传音频，或填写服务器上的音频路径")
+        src = Path(src)
+        if not src.exists():
+            raise gr.Error(f"找不到文件：{src}")
+
+        if upload:
+            dst = INPUT_DIR / f"webui_{int(time.time())}{src.suffix.lower()}";
+            shutil.copy(upload, dst)
+            src = dst
+
+        out_dir = OUT_DIR / src.stem
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        stages = [KARAOKE_MODELS[karaoke], DEREVERB_MODELS[dereverb], DENOISE_MODELS[denoise]]
+        total = 1 + sum(1 for m in stages if m)
+        done = 0
+        progress(0, desc="准备中…")
+
+        r = _separate(src, VOCAL_MODELS[vocal], "1_vocals", out_dir)
+        done += 1
+        progress(done / total, desc="人声/伴奏 完成")
+        vocals, inst = r["main"], r["rest"]
+        lead = vocals
+        backing = None
+
+        if KARAOKE_MODELS[karaoke]:
+            r = _separate(lead, KARAOKE_MODELS[karaoke], "2_lead", out_dir)
+            lead, backing = r["main"], r["rest"]
+            done += 1
+            progress(done / total, desc="和声分离 完成")
+
+        if DEREVERB_MODELS[dereverb]:
+            r = _separate(lead, DEREVERB_MODELS[dereverb], "3_dereverb", out_dir)
+            lead = r["main"]
+            done += 1
+            progress(done / total, desc="去混响 完成")
+
+        if DENOISE_MODELS[denoise]:
+            r = _separate(lead, DENOISE_MODELS[denoise], "4_denoise", out_dir)
+            lead = r["main"]
+            done += 1
+            progress(done / total, desc="降噪 完成")
+
+        dry = out_dir / "lead_dry.wav"
+        shutil.copy(lead, dry)
+
+        all_files = [vocals, inst] + ([backing] if backing else []) + [str(dry)]
+        return vocals, inst, backing, str(dry), all_files
+
+
+    with gr.Blocks(title="人声分离 WebUI") as demo:
+        gr.Markdown("## ✂️ 人声分离 WebUI（UVR / Roformer）\n与 notebook 第 ④ 步同一套模型与后端，模型首次使用自动下载。")
+        with gr.Row():
+            upload = gr.Audio(label="上传音频", type="filepath")
+            server_path = gr.Textbox(label="或填写服务器上的音频路径（如 inputs/xxx.mp3）", lines=1)
+        with gr.Row():
+            vocal = gr.Dropdown(list(VOCAL_MODELS), value="MelBand Roformer Kim FT3 (unwa) · 推荐", label="1. 人声/伴奏")
+            karaoke = gr.Dropdown(list(KARAOKE_MODELS), value="MelBand Karaoke (becruily) · 推荐", label="2. 主唱/和声")
+        with gr.Row():
+            dereverb = gr.Dropdown(list(DEREVERB_MODELS), value="BS-Roformer De-Reverb · 推荐", label="3. 去混响")
+            denoise = gr.Dropdown(list(DENOISE_MODELS), value="不降噪", label="4. 降噪")
+        go = gr.Button("✂️ 开始分离", variant="primary")
+        gr.Markdown("### 分离结果")
+        with gr.Row():
+            o_vocals = gr.Audio(label="完整人声", interactive=False)
+            o_inst = gr.Audio(label="伴奏", interactive=False)
+        with gr.Row():
+            o_backing = gr.Audio(label="和声（选了第 2 步才有）", interactive=False)
+            o_dry = gr.Audio(label="🎯 主唱干声 lead_dry（可直接拿去 RVC 转换）", interactive=False)
+        files = gr.File(label="⬇️ 下载全部 stems", file_count="multiple")
+        go.click(
+            run_chain,
+            [upload, server_path, vocal, karaoke, dereverb, denoise],
+            [o_vocals, o_inst, o_backing, o_dry, files],
+        )
+
+    demo.queue()
+    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("SEP_UI_PORT", "6970")), share=True)
+'''
+    return (SEP_WEBUI_SRC,)
+
+
+@app.cell
+def _(
+    ROOT,
+    SEP_WEBUI_SRC,
+    VPY,
+    is_installed,
+    mo,
+    re,
+    sep_ui_start,
+    sep_ui_stop,
+    subprocess,
+    time,
+    venv_env,
+):
+    import signal as _signal
+
+    mo.stop(not is_installed(), mo.callout("请先完成第 ① 步安装", kind="danger"))
+
+    _sep_py = ROOT / "sep_webui.py"
+    _sep_py.write_text(SEP_WEBUI_SRC, encoding="utf-8")
+
+    _pidf = ROOT / "sep_webui.pid"
+    _log = ROOT / "sep_webui.log"
+
+    if sep_ui_stop.value and _pidf.exists():
+        try:
+            import os as _os
+
+            _os.killpg(int(_pidf.read_text()), _signal.SIGTERM)
+        except Exception as _e:
+            print("停止时出错：", _e)
+
+        _pidf.unlink(missing_ok=True)
+        _msg = mo.callout("分离 WebUI 已停止", kind="neutral")
+
+    elif sep_ui_start.value:
+        _p = subprocess.Popen(
+            [str(VPY), str(_sep_py)],
+            cwd=str(ROOT),
+            env=venv_env(),
+            stdout=open(_log, "w"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+        _pidf.write_text(str(_p.pid))
+
+        _url = None
+
+        for _ in range(90):
+            time.sleep(2)
+            _txt = _log.read_text(errors="ignore")
+            _m = re.search(r"https://[\w\-]+\.gradio\.live", _txt)
+
+            if _m:
+                _url = _m.group(0)
+                break
+
+            if _p.poll() is not None:
+                break
+
+        _tail = "\n".join(_log.read_text(errors="ignore").splitlines()[-25:])
+
+        _msg = (
+            mo.callout(
+                mo.md(f"### ✅ 分离 WebUI 已启动：[{_url}]({_url})\n关闭笔记本即失效。"),
+                kind="success",
+            )
+            if _url
+            else mo.vstack(
+                [
+                    mo.callout(
+                        "未获取到公网链接，日志如下（若提示 No module named gradio：~/rvc_work/venv/bin/pip install gradio）",
+                        kind="warn",
+                    ),
+                    mo.plain_text(_tail),
+                ]
+            )
+        )
+    else:
+        _msg = mo.md("_点击启动后约 10–30 秒出现公网链接_")
 
     _msg
     return
